@@ -45,26 +45,44 @@
    it, that slot is ScheduleData (SMP) or CPUNumber (UP), so an unpatched
    kernel simply reports a mismatch rather than misbehaving. */
 #define TLS_THISTASK 16
+#define TLS_TLSBASE  24         /* &IntETask->iet_TLSSlot: the thread pointer */
 
 static struct Task *gs_task(void)
 {
     return (struct Task *)GS(TLS_THISTASK);
 }
 
+/* This is the sequence Go's get_tls would compile to: one load for the base,
+   then g at offset 0 of it. No call, no stack needed. */
+static APTR *gs_tls(void)
+{
+    return (APTR *)GS(TLS_TLSBASE);
+}
+
 static void *worker(void *arg)
 {
     struct Task *me = FindTask(NULL), *via_gs = gs_task();
-    long i, drift = 0;
+    APTR *slot = gs_tls();
+    long i, drift = 0, tls_bad = 0;
+    APTR mine = (APTR)(0xC0DE0000 + (long)arg);
 
-    /* Stability: if the two-instruction sequence can be preempted onto
-       another core, a long spin should eventually catch it disagreeing. */
+    /* Write a value only this thread should ever see, exactly as a runtime
+       would store its `g`, then keep checking it survives. */
+    if (slot)
+        *slot = mine;
+
     for (i = 0; i < 2000000; i++)
+    {
         if (gs_task() != me)
             drift++;
+        if (gs_tls() != slot || (slot && *slot != mine))
+            tls_bad++;
+    }
 
-    OUT("  thread %ld: FindTask=%p  %%gs=%p  %s  drift=%ld/2000000\n",
-        (long)arg, (void *)me, (void *)via_gs,
-        me == via_gs ? "MATCH" : "MISMATCH", drift);
+    OUT("  thread %ld: task=%p %s  tls=%p val=%p %s  drift=%ld tlsbad=%ld\n",
+        (long)arg, (void *)me, me == via_gs ? "OK" : "BAD",
+        (void *)slot, slot ? *slot : NULL,
+        (slot && *slot == mine) ? "OK" : "BAD", drift, tls_bad);
     return NULL;
 }
 
@@ -81,9 +99,9 @@ int main(void)
 
     OUT("%%gs:16         = %p  (ThisTask, once patched)\n", (void *)slot16);
 
-    OUT("%%gs:24         = %p\n", (void *)slot24);
-    OUT("main: FindTask=%p  %%gs=%p\n",
-           (void *)FindTask(NULL), (void *)gs_task());
+    OUT("%%gs:24         = %p  (ThisTaskTLS, once patched)\n", (void *)slot24);
+    OUT("main: FindTask=%p  %%gs=%p   tls slot @ %p\n",
+        (void *)FindTask(NULL), (void *)gs_task(), (void *)gs_tls());
 
     for (i = 0; i < 4; i++)
         pthread_create(&t[i], NULL, worker, (void *)i);

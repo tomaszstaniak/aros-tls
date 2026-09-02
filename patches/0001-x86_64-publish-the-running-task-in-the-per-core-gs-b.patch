@@ -1,3 +1,22 @@
+From dcc8f48cb2d5af3a3cdffee7efc9e633840b967f Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 10:49:11 +0200
+Subject: [PATCH 1/2] x86_64: publish the running task in the per-core %gs
+ block
+
+FindTask(NULL) is a library call, so it cannot serve as a thread pointer
+for a language runtime, which needs one where there is no stack to call
+on. The per-core tls_t behind %gs is already readable from userspace --
+its GDT descriptor is dpl=3 -- but holds only globals.
+
+Publish the dispatched task there. ThisTask sits before the SMP-only
+field so its offset is the same in UP and SMP builds; consumers outside
+the kernel need one constant, not one per configuration.
+---
+ arch/x86_64-pc/kernel/kernel_cpu.c | 9 +++++++++
+ arch/x86_64-pc/kernel/tls.h        | 9 +++++++++
+ 2 files changed, 18 insertions(+)
+
 diff --git a/arch/x86_64-pc/kernel/kernel_cpu.c b/arch/x86_64-pc/kernel/kernel_cpu.c
 index a7c59899..f511abea 100644
 --- a/arch/x86_64-pc/kernel/kernel_cpu.c
@@ -42,3 +61,6 @@ index 9460024f..7efc3826 100644
  #if defined(__AROSEXEC_SMP__)
      struct X86SchedulerPrivate  *ScheduleData;
  #endif
+-- 
+2.54.0 (Apple Git-157)
+

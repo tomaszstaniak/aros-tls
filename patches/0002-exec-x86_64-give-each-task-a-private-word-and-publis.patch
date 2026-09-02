@@ -1,0 +1,82 @@
+From 5f51a66ed574766fbeb3e918c003ae78ac275ecc Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 10:49:21 +0200
+Subject: [PATCH 2/2] exec, x86_64: give each task a private word and publish
+ its address
+
+A thread pointer needs storage, not just identity. tc_UserData cannot be
+it: it is documented "for use by the task; no restrictions!" and drivers
+across the tree genuinely use it, so a language runtime claiming it would
+collide with the libraries its own programs call.
+
+Put the word in IntETask, which is private and already allocated, so this
+costs no extra allocation. The dispatcher publishes its address, giving
+userspace a writable per-thread word one load away: exactly the shape
+Go's get_tls wants, with g at offset 0.
+---
+ arch/x86_64-pc/kernel/kernel_cpu.c | 7 +++++++
+ arch/x86_64-pc/kernel/tls.h        | 6 ++++++
+ rom/exec/etask.h                   | 7 +++++++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/arch/x86_64-pc/kernel/kernel_cpu.c b/arch/x86_64-pc/kernel/kernel_cpu.c
+index f511abea..81af8884 100644
+--- a/arch/x86_64-pc/kernel/kernel_cpu.c
++++ b/arch/x86_64-pc/kernel/kernel_cpu.c
+@@ -98,11 +98,18 @@ void cpu_Dispatch(struct ExceptionContext *regs)
+      */
+     TLS_SET(ThisTask, task);
+ 
++    /* Cleared here and filled in below: a task with no ETask has no TLS slot,
++       and must not be left looking at the previous task's one. */
++    TLS_SET(ThisTaskTLS, (APTR *)NULL);
++
+     if (task->tc_Flags & TF_ETASK)
+     {
+         taskEtask = GetETask(task);
+         if (taskEtask)
+         {
++            /* Hand userspace the address of this task's private TLS word. */
++            TLS_SET(ThisTaskTLS, &IntETask(taskEtask)->iet_TLSSlot);
++
+             /* Get task's context */
+             ctx = taskEtask->et_RegFrame;
+ 
+diff --git a/arch/x86_64-pc/kernel/tls.h b/arch/x86_64-pc/kernel/tls.h
+index 7efc3826..0da9eb9c 100644
+--- a/arch/x86_64-pc/kernel/tls.h
++++ b/arch/x86_64-pc/kernel/tls.h
+@@ -22,6 +22,12 @@ typedef struct tls
+      * need one constant, not one per build configuration.
+      */
+     struct Task                 *ThisTask;
++    /*
++     * Address of the running task's iet_TLSSlot, or NULL for a task with no
++     * ETask. This is the thread pointer a Go- or Rust-style runtime wants: one
++     * load to get it, and the word it points at is writable and task-private.
++     */
++    APTR                        *ThisTaskTLS;
+ #if defined(__AROSEXEC_SMP__)
+     struct X86SchedulerPrivate  *ScheduleData;
+ #endif
+diff --git a/rom/exec/etask.h b/rom/exec/etask.h
+index 44ae4014..c925a6d7 100644
+--- a/rom/exec/etask.h
++++ b/rom/exec/etask.h
+@@ -56,6 +56,13 @@ struct IntETask
+     APTR                iet_AlertLocation;      /* Alert location for crash handler        */
+     APTR                iet_AlertStack;         /* Frame pointer for stack backtrace       */
+     struct AlertContext iet_AlertData;          /* Extra data coming with the crash        */
++    /*
++     * One pointer-sized word owned by the task, for a language runtime's
++     * thread pointer. The dispatcher publishes its *address* in the per-core
++     * %gs block, so userspace reaches a writable per-thread word with a single
++     * load and no library call. Costs nothing to allocate: the ETask already is.
++     */
++    APTR                iet_TLSSlot;
+ #if defined(__AROSEXEC_SMP__)
+     void                *iet_Session;
+     spinlock_t          iet_TaskLock;
+-- 
+2.54.0 (Apple Git-157)
+
