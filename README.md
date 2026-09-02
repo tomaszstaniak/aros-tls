@@ -109,7 +109,10 @@ Not only Go, which is what prompted it:
 
 * **C and C++** get real `thread_local` instead of a `pthread_getspecific` per
   access.
-* **Rust** could flip `has-thread-local` to true for the AROS target.
+* **Rust** could flip `has-thread-local` to true for the AROS target. Note this
+  is an **optimisation, not an unblock**: Rust's `thread_local!` already works
+  on AROS through its pthread-key fallback — tokio's runtime runs there today —
+  so the gain is dropping a call per access, not enabling something impossible.
 * **Mesa** could drop the list-walking `GetFromTLS` in
   `workbench/libs/mesa/tls.c`.
 * Anything that calls `FindTask(NULL)` in a hot path.
