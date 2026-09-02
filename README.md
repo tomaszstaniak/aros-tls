@@ -93,14 +93,50 @@ Step 1 is deliberately not enough for Go: it gives a thread *identity*, not
 thread *storage*. It is what makes the dispatcher hook, the fixed offset and
 the userspace read verifiable in one run.
 
-## Step 2 (what Go actually needs)
+## Step 2: storage, and it works too
 
-Go needs one writable word per thread to hold `g`. `tc_UserData` cannot be it —
-it is documented "for use by the task; no restrictions!" and drivers and
-applications across the tree genuinely use it, so a language runtime claiming
-it would collide. The slot belongs in `struct IntETask` (`rom/exec/etask.h`),
-which is kernel-private, with the dispatcher caching it into the `%gs` block.
-Tasks without `TF_ETASK` get NULL and simply have no TLS.
+A thread pointer needs storage, not just identity. `tc_UserData` cannot be it:
+it is documented "for use by the task; no restrictions!" and drivers across the
+tree — USB classes, trackdisk, dbus — genuinely use it, so a runtime claiming it
+would collide with the very libraries its programs call.
+
+No new API turned out to be needed. The dispatcher already fetches the ETask on
+every switch, so it can publish the **address** of a private word rather than a
+value. `IntETask` is kernel-private and already allocated, so the word costs no
+extra allocation. Tasks without `TF_ETASK` get NULL, and the slot is cleared on
+entry so such a task never inherits the previous one's pointer.
+
+The dispatcher compiles to three stores:
+
+```
+23f:  65 48 89 04 25 10 00    mov    %rax,%gs:0x10   ; ThisTask
+25d:  65 48 89 04 25 18 00    mov    %rax,%gs:0x18   ; ThisTaskTLS = NULL
+2d1:  65 48 89 04 25 18 00    mov    %rax,%gs:0x18   ; ThisTaskTLS = &iet_TLSSlot
+```
+
+and the probe, with each thread writing a private value through the pointer and
+re-checking it two million times:
+
+```
+%gs:16 = 0x15f8fb0  (ThisTask)
+%gs:24 = 0x15d58b8  (ThisTaskTLS)
+  thread 0: task=0x4be9e980 OK  tls=0x4bedf348 val=0xc0de0000 OK  drift=0 tlsbad=0
+  thread 1: task=0x4bedf6c0 OK  tls=0x4bf20128 val=0xc0de0001 OK  drift=0 tlsbad=0
+  thread 2: task=0x4bf204a0 OK  tls=0x4bf60f98 val=0xc0de0002 OK  drift=0 tlsbad=0
+  thread 3: task=0x4bf61310 OK  tls=0x4bfa1e48 val=0xc0de0003 OK  drift=0 tlsbad=0
+```
+
+Four distinct slot addresses, each thread reading back exactly what it wrote,
+zero drift and zero corruption over eight million reads in total.
+
+So `MOVQ TLS, r` on AROS becomes `movq %gs:0x18, r`, with `g` at offset 0 — the
+same shape as Plan 9, where the base comes from a global symbol instead of a
+segment.
+
+Caveats worth keeping: verified under QEMU on a **UP** kernel only. The claim
+that a single load closes the SMP migration window is an argument, not a
+measurement, and nothing here has been run against AROS's own test suite.
+
 
 ## Who else benefits
 
@@ -111,9 +147,14 @@ That is the case for sending this upstream rather than carrying it.
 
 ## Building and testing
 
-The patch targets `deadwood2/AROS` (the ABIv11 fork AROS One is built from),
-whose `tls.h` is byte-identical to `aros-development-team/AROS`, so it applies
-to both. The build tree lives on the `arosbuild` sparse image next to the
-sandbox checkout; it is configured
-(`--target=pc-x86_64 --with-aros-toolchain-install=…`) and its crosstools are
-built, but AROS itself has never been built from it — that comes first.
+The patches target `deadwood2/AROS` (the ABIv11 fork AROS One is built from),
+whose `tls.h` is byte-identical to `aros-development-team/AROS`, so they apply
+to both. Build with `build-aros.sh` in the sandbox repo, which carries the
+macOS workarounds; `build-aros.sh bootiso` then produces a live CD.
+
+To read the probe's output without a Shell — the live CD's `Tools` menu is
+empty, and there is still no way to get a file out of the VM — put `C:tlsprobe`
+into `workbench/s/Startup-Sequence` ahead of the Wanderer block and make that
+block's condition unsatisfiable. The probe then runs at boot and its output
+stays on the console for a screendump. Note that `bootiso` regenerates
+`Startup-Sequence` from source, so editing the built copy has no effect.
