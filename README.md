@@ -1,112 +1,68 @@
-# aros-tls — a one-instruction thread pointer for AROS x86_64
+# aros-tls
 
-AROS x86_64 has no per-thread pointer that userspace can read cheaply.
-`FindTask(NULL)` is a library call, and GCC for AROS is built `--disable-tls`,
-so `__thread` lowers to `__emutls_get_address` — a call plus a
-`pthread_getspecific` on **every access**. That is enough for C and for Rust's
-`thread_local!`, which is why both work today. It is not enough for a Go
-runtime, whose `get_tls` runs in signal trampolines and at thread entry where
-there is no `g` and no callable stack yet.
+**Real thread-local storage for AROS x86_64, in 38 lines of kernel.**
 
-This repository is the patch that fixes it, and the probe that proves it.
-
-## Why it can be small
-
-AROS already keeps a per-CPU block behind `%gs`
-(`arch/x86_64-pc/kernel/tls.h`), and `kernel_startup.c` builds its GDT
-descriptor with **`dpl = 3`** — userspace may read it. There is no `swapgs`
-anywhere in the kernel and no `MSR_FS_BASE`/`MSR_GS_BASE` write, so the segment
-base is a plain GDT descriptor set once at boot.
-
-So the missing piece is not a mechanism. It is one store: the dispatcher
-already knows which task it is about to run, and never writes it anywhere
-userspace can see.
-
-## Measured before writing any patch
-
-`probe/tlsprobe.c`, run on AROS One (x86_64, ABIv11) under QEMU:
+Two patches against the AROS kernel give userspace a per-thread pointer it can
+read in a *single instruction*, with no library call. They also make
+`FindTask(NULL)` one instruction. Both are measured on a booted system, not
+just argued for.
 
 ```
-SysBase        = 0x1002950
-%gs:0          = 0x1002950   MATCH - userspace %gs works
-%gs:8          = 0x0         (KernelBase)
-%gs:16         = 0x0         -> UP (CPUNumber) build
-main:      FindTask=0x5ab99360
-thread 0:  FindTask=0x4ad7c490     thread 2:  FindTask=0x4da97960
-thread 1:  FindTask=0x4bca1810     thread 3:  FindTask=0x4da98790
+movq %gs:0x10, %rax     # the running task            (was: FindTask(NULL), a library call)
+movq %gs:0x18, %rax     # this thread's private word  (was: nothing like it existed)
 ```
 
-* `movq %gs:0, %rax` returns `SysBase` from userspace, in one instruction.
-* `KernelBase` reads 0 — nothing ever calls `TLS_SET(KernelBase, …)`.
-* `%gs:16` is 0, i.e. `CPUNumber`, so this is a **UP build**: `__AROSEXEC_SMP__`
-  is off and there is no per-core `RunningTask`, even under `qemu -smp 2`.
-* Every pthread is a **distinct Exec Task**, so a per-task slot is the right
-  home for thread-private data.
+## The problem
 
-## The patch, step 1 (minimal, no ABI questions)
+AROS x86_64 has no cheap per-thread pointer.
 
-Put the current task pointer in the per-CPU block and set it at dispatch:
+* `FindTask(NULL)` is a library call through a jump table.
+* GCC for AROS is configured `--disable-tls`, so `__thread` lowers to
+  **emulated** TLS: a call to `__emutls_get_address` plus a
+  `pthread_getspecific` on *every access*.
+* `struct ExecBase` has no `ThisTask` field — it went away with the SMP rework.
+* Mesa carries its own `GetFromTLS` that walks a list keyed on the task.
 
-* `arch/x86_64-pc/kernel/tls.h` — add `struct Task *ThisTask` **before** the
-  `#if defined(__AROSEXEC_SMP__)` field, so its offset is identical in UP and
-  SMP builds. Userspace needs one constant, not one per build config.
-* `arch/x86_64-pc/kernel/kernel_cpu.c` — one `TLS_SET(ThisTask, task)` in
-  `cpu_Dispatch`, right after `core_Dispatch()` returns the task to run.
+That is enough for C, and enough for Rust's `thread_local!`, which is why both
+work on AROS today — they just pay a function call per access. It is **not**
+enough for a language runtime like Go's, whose thread-pointer read happens in
+signal trampolines and at thread entry, where there is no stack to make a call
+on.
 
-`FindTask(NULL)` then becomes `movq %gs:16, %rax` — and note there is no
-migration race even on SMP. A two-instruction sequence that read a per-CPU
-pointer and then dereferenced it could be preempted in between and end up
-reading another core's task. Here the single load already yields *our* task,
-because at the instant it executes we are the task running on that core.
+## The insight
 
-### Step 1 result: it works
+The mechanism was already there, unused.
 
-Built from `deadwood2/AROS` at `5376f09b` and booted as a live CD under QEMU
-(`patches/0001-*.patch`, two files, 18 lines). The patch compiles to exactly
-one instruction in `cpu_Dispatch`:
+AROS keeps a per-CPU block behind `%gs` (`arch/x86_64-pc/kernel/tls.h`), and
+`kernel_startup.c` builds its GDT descriptor with **`dpl = 3`** — so userspace
+is allowed to read it. There is no `swapgs` anywhere in the kernel and no
+`MSR_FS_BASE`/`MSR_GS_BASE` write; the segment base is a plain GDT descriptor
+set once at boot. Verified from userspace before writing any patch:
+`movq %gs:0, %rax` returns `SysBase`.
 
-```
-23f:  65 48 89 04 25 10 00    mov    %rax,%gs:0x10
-```
+But the block held only globals. The dispatcher knows which task it is about to
+run and never wrote it anywhere userspace could see. So the fix is not a new
+mechanism — it is a store.
 
-and the probe, run from the Startup-Sequence so no shell is needed, reports:
+## What the patches do
 
-```
-SysBase        = 0x1002990
-%gs:0          = 0x1002990   MATCH - userspace %gs works
-%gs:16         = 0x15def20   (ThisTask, once patched)
-main: FindTask=0x15def20  %gs=0x15def20
-  thread 0: FindTask=0x4be9e670  %gs=0x4be9e670  MATCH  drift=0/2000000
-  thread 2: FindTask=0x4bf20190  %gs=0x4bf20190  MATCH  drift=0/2000000
-  thread 3: FindTask=0x4bf61090  %gs=0x4bf61090  MATCH  drift=0/2000000
-  thread 1: FindTask=0x4bedf3b0  %gs=0x4bedf3b0  MATCH  drift=0/2000000
-```
+**`0001` — publish the running task.** Adds `struct Task *ThisTask` to `tls_t`
+and one `TLS_SET` in `cpu_Dispatch`. The field sits *before* the SMP-only
+member so its offset is identical in UP and SMP builds: consumers outside the
+kernel need one constant, not one per build configuration.
 
-Five threads, five matches, and zero drift over eight million reads in total.
-`FindTask(NULL)` is now a single `movq %gs:0x10, %rax` from userspace.
+**`0002` — give each task a private word.** Adds `APTR iet_TLSSlot` to
+`struct IntETask` and publishes its **address**. `IntETask` is kernel-private
+and already allocated, so this costs no extra allocation, and no new
+kernel.resource API is needed. Tasks without `TF_ETASK` get NULL, and the slot
+is cleared on entry so such a task never inherits the previous one's pointer.
 
-Verified on AROS x86_64 under QEMU only. Not verified on real hardware, and
-**not on an SMP build** — this kernel is UP, so the claim that a single load
-closes the migration window is still an argument, not a measurement.
+`tc_UserData` was considered and rejected as the storage: it is documented "for
+use by the task; no restrictions!" and drivers across the tree — USB classes,
+trackdisk, dbus — genuinely use it, so a language runtime claiming it would
+collide with the very libraries its own programs call.
 
-Step 1 is deliberately not enough for Go: it gives a thread *identity*, not
-thread *storage*. It is what makes the dispatcher hook, the fixed offset and
-the userspace read verifiable in one run.
-
-## Step 2: storage, and it works too
-
-A thread pointer needs storage, not just identity. `tc_UserData` cannot be it:
-it is documented "for use by the task; no restrictions!" and drivers across the
-tree — USB classes, trackdisk, dbus — genuinely use it, so a runtime claiming it
-would collide with the very libraries its programs call.
-
-No new API turned out to be needed. The dispatcher already fetches the ETask on
-every switch, so it can publish the **address** of a private word rather than a
-value. `IntETask` is kernel-private and already allocated, so the word costs no
-extra allocation. Tasks without `TF_ETASK` get NULL, and the slot is cleared on
-entry so such a task never inherits the previous one's pointer.
-
-The dispatcher compiles to three stores:
+Three stores in the dispatcher, and nothing else on the hot path:
 
 ```
 23f:  65 48 89 04 25 10 00    mov    %rax,%gs:0x10   ; ThisTask
@@ -114,47 +70,91 @@ The dispatcher compiles to three stores:
 2d1:  65 48 89 04 25 18 00    mov    %rax,%gs:0x18   ; ThisTaskTLS = &iet_TLSSlot
 ```
 
-and the probe, with each thread writing a private value through the pointer and
-re-checking it two million times:
+There is no SMP migration hazard. A two-instruction sequence that read a
+per-CPU pointer and then dereferenced it could be preempted in between and end
+up reading another core's task. Here a *single* load already yields our own
+task, because at the instant it executes we are the task running on that core.
+
+## Results
+
+`probe/tlsprobe.c`, built from a patched tree and run on a live CD under QEMU.
+Each thread writes a private value through the pointer and re-checks it two
+million times:
 
 ```
 %gs:16 = 0x15f8fb0  (ThisTask)
 %gs:24 = 0x15d58b8  (ThisTaskTLS)
+main: FindTask=0x15f8fb0  %gs=0x15f8fb0
   thread 0: task=0x4be9e980 OK  tls=0x4bedf348 val=0xc0de0000 OK  drift=0 tlsbad=0
   thread 1: task=0x4bedf6c0 OK  tls=0x4bf20128 val=0xc0de0001 OK  drift=0 tlsbad=0
   thread 2: task=0x4bf204a0 OK  tls=0x4bf60f98 val=0xc0de0002 OK  drift=0 tlsbad=0
   thread 3: task=0x4bf61310 OK  tls=0x4bfa1e48 val=0xc0de0003 OK  drift=0 tlsbad=0
 ```
 
-Four distinct slot addresses, each thread reading back exactly what it wrote,
+Four distinct slot addresses, every thread reading back exactly what it wrote,
 zero drift and zero corruption over eight million reads in total.
 
-So `MOVQ TLS, r` on AROS becomes `movq %gs:0x18, r`, with `g` at offset 0 — the
-same shape as Plan 9, where the base comes from a global symbol instead of a
-segment.
+### What was *not* verified
 
-Caveats worth keeping: verified under QEMU on a **UP** kernel only. The claim
-that a single load closes the SMP migration window is an argument, not a
-measurement, and nothing here has been run against AROS's own test suite.
+* QEMU only — **not** real hardware.
+* A **UP** kernel only. `__AROSEXEC_SMP__` was off (`%gs:16` read back as
+  `CPUNumber`, not a `ScheduleData` pointer, even under `qemu -smp 2`). The
+  single-load argument above is sound but remains an argument on SMP, not a
+  measurement.
+* Not run against AROS's own nightly test suite.
 
+## Who this is for
 
-## Who else benefits
+Not only Go, which is what prompted it:
 
-Not only Go. Real `thread_local` for C and C++ instead of a
-`pthread_getspecific` per access; `has-thread-local: true` for the Rust target;
-and Mesa could drop the list-walking `GetFromTLS` in `workbench/libs/mesa/tls.c`.
-That is the case for sending this upstream rather than carrying it.
+* **C and C++** get real `thread_local` instead of a `pthread_getspecific` per
+  access.
+* **Rust** could flip `has-thread-local` to true for the AROS target.
+* **Mesa** could drop the list-walking `GetFromTLS` in
+  `workbench/libs/mesa/tls.c`.
+* Anything that calls `FindTask(NULL)` in a hot path.
 
-## Building and testing
+A worked consumer: [go-aros](https://github.com/tomaszstaniak/go-aros) lowers
+Go's `MOVQ TLS, r` to `movq %gs:24, r`. The resulting `g` access assembles
+byte-identically to Plan 9's; only the base load differs, and this one is
+cheaper — one segment-relative load with no relocation, where Plan 9 needs a
+PC-relative load of a global.
 
-The patches target `deadwood2/AROS` (the ABIv11 fork AROS One is built from),
-whose `tls.h` is byte-identical to `aros-development-team/AROS`, so they apply
-to both. Build with `build-aros.sh` in the sandbox repo, which carries the
-macOS workarounds; `build-aros.sh bootiso` then produces a live CD.
+## Applying and testing
 
-To read the probe's output without a Shell — the live CD's `Tools` menu is
-empty, and there is still no way to get a file out of the VM — put `C:tlsprobe`
-into `workbench/s/Startup-Sequence` ahead of the Wanderer block and make that
-block's condition unsatisfiable. The probe then runs at boot and its output
+The patches are against `deadwood2/AROS` (the ABIv11 fork), whose `tls.h` is
+byte-identical to `aros-development-team/AROS`, so they apply to both.
+
+```sh
+git am patches/0001-*.patch patches/0002-*.patch
+# configure with --target=pc-x86_64, then build, then:
+make bootiso
+```
+
+To read the probe's output there is a wrinkle worth knowing: a freshly built
+live CD has an **empty `Tools` menu**, and there is no reliable way to get a
+file out of a QEMU guest. So put `C:tlsprobe` into
+`workbench/s/Startup-Sequence` ahead of the Wanderer block and make that
+block's condition unsatisfiable — the probe then runs at boot and its output
 stays on the console for a screendump. Note that `bootiso` regenerates
 `Startup-Sequence` from source, so editing the built copy has no effect.
+
+Build the probe with the AROS SDK, linking libpthread in a group — the emulated
+TLS helper lives in `libgcc.a`, which the driver places after it:
+
+```sh
+x86_64-aros-gcc -o tlsprobe probe/tlsprobe.c \
+    -Wl,--start-group "$SDK/lib/libpthread.a" -lgcc -Wl,--end-group
+```
+
+## Status
+
+Unsubmitted. Offered here in the hope it is useful; feedback from AROS
+developers on the placement of `ThisTaskTLS` and on SMP behaviour would be
+especially welcome, since SMP is the part this cannot test.
+
+## Licence
+
+The patches modify AROS source and are offered under the same terms, the
+[AROS Public License](https://aros.sourceforge.io/documentation/developers/licenses.php).
+`probe/tlsprobe.c` is original and may be used under the APL as well.
