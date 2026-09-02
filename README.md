@@ -59,6 +59,36 @@ pointer and then dereferenced it could be preempted in between and end up
 reading another core's task. Here the single load already yields *our* task,
 because at the instant it executes we are the task running on that core.
 
+### Step 1 result: it works
+
+Built from `deadwood2/AROS` at `5376f09b` and booted as a live CD under QEMU
+(`patches/0001-*.patch`, two files, 18 lines). The patch compiles to exactly
+one instruction in `cpu_Dispatch`:
+
+```
+23f:  65 48 89 04 25 10 00    mov    %rax,%gs:0x10
+```
+
+and the probe, run from the Startup-Sequence so no shell is needed, reports:
+
+```
+SysBase        = 0x1002990
+%gs:0          = 0x1002990   MATCH - userspace %gs works
+%gs:16         = 0x15def20   (ThisTask, once patched)
+main: FindTask=0x15def20  %gs=0x15def20
+  thread 0: FindTask=0x4be9e670  %gs=0x4be9e670  MATCH  drift=0/2000000
+  thread 2: FindTask=0x4bf20190  %gs=0x4bf20190  MATCH  drift=0/2000000
+  thread 3: FindTask=0x4bf61090  %gs=0x4bf61090  MATCH  drift=0/2000000
+  thread 1: FindTask=0x4bedf3b0  %gs=0x4bedf3b0  MATCH  drift=0/2000000
+```
+
+Five threads, five matches, and zero drift over eight million reads in total.
+`FindTask(NULL)` is now a single `movq %gs:0x10, %rax` from userspace.
+
+Verified on AROS x86_64 under QEMU only. Not verified on real hardware, and
+**not on an SMP build** — this kernel is UP, so the claim that a single load
+closes the migration window is still an argument, not a measurement.
+
 Step 1 is deliberately not enough for Go: it gives a thread *identity*, not
 thread *storage*. It is what makes the dispatcher hook, the fixed offset and
 the userspace read verifiable in one run.

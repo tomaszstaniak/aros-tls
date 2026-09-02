@@ -1,0 +1,44 @@
+diff --git a/arch/x86_64-pc/kernel/kernel_cpu.c b/arch/x86_64-pc/kernel/kernel_cpu.c
+index a7c59899..f511abea 100644
+--- a/arch/x86_64-pc/kernel/kernel_cpu.c
++++ b/arch/x86_64-pc/kernel/kernel_cpu.c
+@@ -89,6 +89,15 @@ void cpu_Dispatch(struct ExceptionContext *regs)
+         bug("[Kernel:%03u]" DEBUGCOLOR_SET " %s: Task to Run @ 0x%p" DEBUGCOLOR_RESET "\n", cpunum, __func__, task);
+     )
+ 
++    /*
++     * Publish the task in the per-core %gs block. Userspace can then get it
++     * with a single load, which is what a language runtime's thread pointer
++     * needs: no library call, usable where there is no stack to call on.
++     * One instruction also means no preemption window -- the value read is
++     * by definition the task doing the reading.
++     */
++    TLS_SET(ThisTask, task);
++
+     if (task->tc_Flags & TF_ETASK)
+     {
+         taskEtask = GetETask(task);
+diff --git a/arch/x86_64-pc/kernel/tls.h b/arch/x86_64-pc/kernel/tls.h
+index 9460024f..7efc3826 100644
+--- a/arch/x86_64-pc/kernel/tls.h
++++ b/arch/x86_64-pc/kernel/tls.h
+@@ -9,10 +9,19 @@
+ 
+ #include "apic.h"
+ 
++struct Task;
++
+ typedef struct tls
+ {
+     struct ExecBase             *SysBase;
+     void                        *KernelBase;    /* Base of kernel.resource              */
++    /*
++     * The task running on this core, published so userspace can read it in a
++     * single instruction. Deliberately placed before the SMP-only field so its
++     * offset is the same in UP and SMP builds -- consumers outside the kernel
++     * need one constant, not one per build configuration.
++     */
++    struct Task                 *ThisTask;
+ #if defined(__AROSEXEC_SMP__)
+     struct X86SchedulerPrivate  *ScheduleData;
+ #endif

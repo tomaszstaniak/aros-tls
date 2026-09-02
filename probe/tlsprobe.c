@@ -29,15 +29,26 @@
 #include <exec/execbase.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <aros/debug.h>
+
+/* Results go to the kernel debug channel as well as stdout. There is still no
+   way to get a file out of the VM (the vvfat share corrupts guest writes and
+   SER: never reaches QEMU's serial log), but kprintf lands on the raw serial
+   port, so `-serial file:` captures it -- and that works with no shell, which
+   means the probe can run straight from the Startup-Sequence. */
+#define OUT(...) do { printf(__VA_ARGS__); kprintf(__VA_ARGS__); } while (0)
 
 #define GS(off) ({ IPTR __v; \
     __asm__ volatile("movq %%gs:%P1,%0" : "=r"(__v) : "n"(off)); __v; })
 
-static int smp;                 /* slot 16 looked like a pointer */
+/* After the aros-tls patch, tls_t slot 16 is `struct Task *ThisTask`. Before
+   it, that slot is ScheduleData (SMP) or CPUNumber (UP), so an unpatched
+   kernel simply reports a mismatch rather than misbehaving. */
+#define TLS_THISTASK 16
 
 static struct Task *gs_task(void)
 {
-    return smp ? *(struct Task **)GS(16) : NULL;
+    return (struct Task *)GS(TLS_THISTASK);
 }
 
 static void *worker(void *arg)
@@ -51,9 +62,9 @@ static void *worker(void *arg)
         if (gs_task() != me)
             drift++;
 
-    printf("  thread %ld: FindTask=%p  %%gs=%p  %s  drift=%ld/2000000\n",
-           (long)arg, (void *)me, (void *)via_gs,
-           me == via_gs ? "MATCH" : "MISMATCH", drift);
+    OUT("  thread %ld: FindTask=%p  %%gs=%p  %s  drift=%ld/2000000\n",
+        (long)arg, (void *)me, (void *)via_gs,
+        me == via_gs ? "MATCH" : "MISMATCH", drift);
     return NULL;
 }
 
@@ -63,19 +74,15 @@ int main(void)
     pthread_t t[4];
     long i;
 
-    printf("SysBase        = %p\n", (void *)SysBase);
-    printf("%%gs:0          = %p  %s\n", (void *)sb,
+    OUT("SysBase        = %p\n", (void *)SysBase);
+    OUT("%%gs:0          = %p  %s\n", (void *)sb,
            sb == (IPTR)SysBase ? "MATCH - userspace %gs works" : "MISMATCH");
-    printf("%%gs:8          = %p  (KernelBase)\n", (void *)kb);
+    OUT("%%gs:8          = %p  (KernelBase)\n", (void *)kb);
 
-    /* A pointer here means ScheduleData, i.e. an SMP kernel; a small integer
-       means CPUNumber, i.e. UP — and then there is no per-core RunningTask. */
-    smp = slot16 > 0x10000;
-    printf("%%gs:16         = %p  -> %s build\n", (void *)slot16,
-           smp ? "SMP (ScheduleData)" : "UP (CPUNumber)");
+    OUT("%%gs:16         = %p  (ThisTask, once patched)\n", (void *)slot16);
 
-    printf("%%gs:24         = %p\n", (void *)slot24);
-    printf("main: FindTask=%p  %%gs=%p\n",
+    OUT("%%gs:24         = %p\n", (void *)slot24);
+    OUT("main: FindTask=%p  %%gs=%p\n",
            (void *)FindTask(NULL), (void *)gs_task());
 
     for (i = 0; i < 4; i++)
@@ -83,6 +90,6 @@ int main(void)
     for (i = 0; i < 4; i++)
         pthread_join(t[i], NULL);
 
-    printf("done\n");
+    OUT("done\n");
     return 0;
 }
