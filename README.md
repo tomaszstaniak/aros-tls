@@ -150,9 +150,41 @@ x86_64-aros-gcc -o tlsprobe probe/tlsprobe.c \
     -Wl,--start-group "$SDK/lib/libpthread.a" -lgcc -Wl,--end-group
 ```
 
+## Design gap: hosted targets (from AROS developer feedback)
+
+Posted on aros-exec; deadwood's review raised a point this README did not:
+**the same x86_64 user binary must run on the native kernel and on the hosted
+ones** (AROS as a Linux or Windows process). Those have their own kernels
+without this patch, and on Windows-hosted `%gs` belongs to the host's TEB. A
+binary that hard-codes `movq %gs:0x18` — which is what this README and the
+go-aros lowering currently assume — would crash there. He is right.
+
+The kernel-side store is fine as a per-target thing; it lives in
+`arch/x86_64-pc/kernel` and always would. What has to change is that **user
+code must not know the offset**. The revised shape:
+
+* each kernel publishes the task's TLS word wherever it can — native via the
+  existing `%gs` GDT block; linux-hosted plausibly via `arch_prctl(ARCH_SET_GS)`
+  in its dispatcher (unverified); windows-hosted via a TEB TLS slot;
+* a small portable call in `kernel.resource` returns the segment-relative
+  offset once at startup; the program then reads `%gs:offset`. Still one load,
+  no call on the hot path, no constant in the binary. This is precisely Go's
+  Windows/Android model (`runtime.tls_g`), so the consumer side is a known
+  shape;
+* cross-arch, the discovery call is the portable part and the register is
+  implied by the architecture (`TPIDR_EL0` on aarch64).
+
+Also from the review: `FindTask(NULL)` itself could inline to the direct read
+on x86_64-native and stay an LVO call elsewhere, giving ordinary programs the
+speedup with no source change. That is a separate patch.
+
+The patches in this repo are the native-only first cut and stand as measured;
+the ABI they imply for user code is **not** the final one.
+
 ## Status
 
-Unsubmitted. Offered here in the hope it is useful; feedback from AROS
+Posted to aros-exec; to be filed on the AROS GitHub issue tracker so more
+developers see it. Native only, hosted untested. Offered here in the hope it is useful; feedback from AROS
 developers on the placement of `ThisTaskTLS` and on SMP behaviour would be
 especially welcome, since SMP is the part this cannot test.
 
